@@ -1,21 +1,27 @@
-import type {RenderMediaOnDownload} from '@remotion/renderer';
+import type {RenderMediaOnDownload, StitchingState} from '@remotion/renderer';
 import {
 	getCompositions,
 	openBrowser,
+	renderFrames,
 	RenderInternals,
-	renderStill,
+	renderMedia,
 } from '@remotion/renderer';
-import {mkdirSync} from 'fs';
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import {chalk} from './chalk';
 import {ConfigInternals} from './config';
-import {determineFinalImageFormat} from './determine-image-format';
 import {findEntryPoint} from './entry-point';
 import {
 	getAndValidateAbsoluteOutputFile,
 	getCliOptions,
+	getFinalCodec,
+	validateFfmepgCanUseCodec,
 } from './get-cli-options';
 import {getCompositionWithDimensionOverride} from './get-composition-with-dimension-override';
+import {getOutputFilename} from './get-filename';
+import {getRenderMediaOptions} from './get-render-media-options';
+import {getImageFormat} from './image-formats';
 import {Log} from './log';
 import {parsedCli, quietFlagProvided} from './parse-command-line';
 import type {DownloadProgress} from './progress-bar';
@@ -23,27 +29,23 @@ import {
 	createOverwriteableCliOutput,
 	makeRenderingAndStitchingProgress,
 } from './progress-bar';
-import {renderInner} from './render-inner';
 import {bundleOnCliOrTakeServeUrl} from './setup-cache';
 import type {RenderStep} from './step';
 import {truthy} from './truthy';
-import {
-	getOutputLocation,
-	getUserPassedOutputLocation,
-} from './user-passed-output-location';
+import {getUserPassedOutputLocation} from './user-passed-output-location';
 
-export const still = async (remotionRoot: string, args: string[]) => {
-	if (parsedCli.frames) {
+export const renderInner = async (
+	type: 'series' | 'still',
+	remotionRoot: string,
+	args: string[]
+) => {
+	if (type === 'still' && parsedCli.frames) {
 		Log.error(
-			'--frames flag was passed to the `still` command. This flag only works with the `render` command. Did you mean `--frame`? See reference: https://www.remotion.dev/docs/cli/'
+			'--frames flag was passed to the `still` command. This flag only works with the `series` command. Did you mean `--frame`? See reference: https://www.remotion.dev/docs/cli/'
 		);
 		process.exit(1);
 	}
 
-	return renderInner('still', remotionRoot, args);
-};
-
-const xstill = async (remotionRoot: string, args: string[]) => {
 	const startTime = Date.now();
 	const {
 		file,
@@ -68,9 +70,12 @@ const xstill = async (remotionRoot: string, args: string[]) => {
 		browser,
 		browserExecutable,
 		chromiumOptions,
+		concurrency,
 		envVariables,
+		everyNthFrame,
 		ffmpegExecutable,
 		ffprobeExecutable,
+		frameRange,
 		height,
 		inputProps,
 		overwrite,
@@ -79,11 +84,11 @@ const xstill = async (remotionRoot: string, args: string[]) => {
 		puppeteerTimeout,
 		quality,
 		scale,
-		stillFrame,
+		shouldOutputImageSequence,
 		width,
 	} = await getCliOptions({
 		isLambda: false,
-		type: 'still',
+		type: 'series',
 		remotionRoot,
 	});
 
@@ -110,6 +115,7 @@ const xstill = async (remotionRoot: string, args: string[]) => {
 	const steps: RenderStep[] = [
 		RenderInternals.isServeUrl(fullPath) ? null : ('bundling' as const),
 		'rendering' as const,
+		shouldOutputImageSequence ? null : ('stitching' as const),
 	].filter(truthy);
 
 	const {urlOrBundle, cleanup: cleanupBundle} = await bundleOnCliOrTakeServeUrl(
@@ -166,17 +172,25 @@ const xstill = async (remotionRoot: string, args: string[]) => {
 			width,
 			args: remainingArgs,
 		});
-	const {format: imageFormat, source} = determineFinalImageFormat({
-		cliFlag: parsedCli['image-format'] ?? null,
-		configImageFormat: ConfigInternals.getUserPreferredImageFormat() ?? null,
+
+	const {codec, reason: codecReason} = getFinalCodec({
 		downloadName: null,
 		outName: getUserPassedOutputLocation(argsAfterComposition),
-		isLambda: false,
+	});
+	validateFfmepgCanUseCodec(codec, remotionRoot);
+
+	RenderInternals.validateEvenDimensionsWithCodec({
+		width: config.width,
+		height: config.height,
+		codec,
+		scale,
 	});
 
-	const relativeOutputLocation = getOutputLocation({
-		compositionId,
-		defaultExtension: imageFormat,
+	const relativeOutputLocation = getOutputFilename({
+		codec,
+		imageSequence: shouldOutputImageSequence,
+		compositionName: compositionId,
+		defaultExtension: RenderInternals.getFileExtensionFromCodec(codec, 'final'),
 		args: argsAfterComposition,
 	});
 
@@ -187,69 +201,161 @@ const xstill = async (remotionRoot: string, args: string[]) => {
 
 	Log.info(
 		chalk.gray(
-			`Entry point = ${file} (${entryPointReason}), Output = ${relativeOutputLocation}, Format = ${imageFormat} (${source}), Composition = ${compositionId} (${reason})`
+			`Entry point = ${file} (${entryPointReason}), Composition = ${compositionId} (${reason}), Codec = ${codec} (${codecReason}), Output = ${relativeOutputLocation}`
 		)
 	);
-	mkdirSync(path.join(absoluteOutputLocation, '..'), {
-		recursive: true,
-	});
+
+	const outputDir = shouldOutputImageSequence
+		? absoluteOutputLocation
+		: await fs.promises.mkdtemp(path.join(os.tmpdir(), 'react-motion-render'));
+
+	Log.verbose('Output dir', outputDir);
 
 	const renderProgress = createOverwriteableCliOutput(quietFlagProvided());
-	const renderStart = Date.now();
-
+	const realFrameRange = RenderInternals.getRealFrameRange(
+		config.durationInFrames,
+		frameRange
+	);
+	const totalFrames: number[] = RenderInternals.getFramesToRender(
+		realFrameRange,
+		everyNthFrame
+	);
+	let encodedFrames = 0;
+	let renderedFrames = 0;
+	let encodedDoneIn: number | null = null;
+	let renderedDoneIn: number | null = null;
+	let stitchStage: StitchingState = 'encoding';
 	const downloads: DownloadProgress[] = [];
-	let frames = 0;
-	const totalFrames = 1;
 
 	const updateProgress = () => {
-		renderProgress.update(
+		if (totalFrames.length === 0) {
+			throw new Error('totalFrames should not be 0');
+		}
+
+		return renderProgress.update(
 			makeRenderingAndStitchingProgress({
 				rendering: {
-					frames,
-					concurrency: 1,
-					doneIn: frames === totalFrames ? Date.now() - renderStart : null,
+					frames: renderedFrames,
+					totalFrames: totalFrames.length,
+					concurrency: RenderInternals.getActualConcurrency(concurrency),
+					doneIn: renderedDoneIn,
 					steps,
-					totalFrames,
 				},
+				stitching: shouldOutputImageSequence
+					? null
+					: {
+							doneIn: encodedDoneIn,
+							frames: encodedFrames,
+							stage: stitchStage,
+							steps,
+							totalFrames: totalFrames.length,
+							codec,
+					  },
 				downloads,
-				stitching: null,
 			})
 		);
 	};
 
-	updateProgress();
+	const imageFormat = getImageFormat(
+		shouldOutputImageSequence ? undefined : codec
+	);
 
-	await renderStill({
-		composition: config,
-		frame: stillFrame,
-		output: absoluteOutputLocation,
+	if (shouldOutputImageSequence) {
+		fs.mkdirSync(absoluteOutputLocation, {
+			recursive: true,
+		});
+		if (imageFormat === 'none') {
+			Log.error(
+				'Cannot render an image sequence with a codec that renders no images.'
+			);
+			Log.error(`codec = ${codec}, imageFormat = ${imageFormat}`);
+			process.exit(1);
+		}
+
+		await renderFrames({
+			config,
+			imageFormat,
+			inputProps,
+			onFrameUpdate: (rendered) => {
+				renderedFrames = rendered;
+				updateProgress();
+			},
+			onStart: () => undefined,
+			onDownload: (src: string) => {
+				if (src.startsWith('data:')) {
+					Log.info(
+						'\nWriting Data URL to file: ',
+						src.substring(0, 30) + '...'
+					);
+				} else {
+					Log.info('\nDownloading asset... ', src);
+				}
+			},
+			outputDir,
+			serveUrl: urlOrBundle,
+			dumpBrowserLogs: RenderInternals.isEqualOrBelowLogLevel(
+				ConfigInternals.Logging.getLogLevel(),
+				'verbose'
+			),
+			everyNthFrame,
+			envVariables,
+			frameRange,
+			concurrency,
+			puppeteerInstance,
+			quality,
+			timeoutInMilliseconds: puppeteerTimeout,
+			chromiumOptions,
+			scale,
+			ffmpegExecutable,
+			ffprobeExecutable,
+			browserExecutable,
+			port,
+			downloadMap,
+		});
+		renderedDoneIn = Date.now() - startTime;
+
+		updateProgress();
+		Log.info();
+		Log.info();
+		Log.info(chalk.green('\nYour image sequence is ready!'));
+		Log.info(chalk.cyan(`▶ ${absoluteOutputLocation}`));
+
+		return;
+	}
+
+	const options = await getRenderMediaOptions({
+		config,
+		outputLocation: absoluteOutputLocation,
 		serveUrl: urlOrBundle,
-		quality,
-		dumpBrowserLogs: RenderInternals.isEqualOrBelowLogLevel(
-			ConfigInternals.Logging.getLogLevel(),
-			'verbose'
-		),
-		envVariables,
-		imageFormat,
-		inputProps,
-		chromiumOptions,
-		timeoutInMilliseconds: ConfigInternals.getCurrentPuppeteerTimeout(),
-		scale,
-		ffmpegExecutable,
-		browserExecutable,
-		overwrite,
-		onDownload,
-		port,
-		downloadMap,
+		codec,
+		remotionRoot,
 	});
 
-	frames = 1;
-	updateProgress();
+	await renderMedia({
+		...options,
+		onProgress: (update) => {
+			encodedDoneIn = update.encodedDoneIn;
+			encodedFrames = update.encodedFrames;
+			renderedDoneIn = update.renderedDoneIn;
+			stitchStage = update.stitchStage;
+			renderedFrames = update.renderedFrames;
+			updateProgress();
+		},
+		puppeteerInstance,
+		onDownload,
+		downloadMap,
+		onSlowestFrames: (slowestFrames) => {
+			Log.verbose();
+			Log.verbose(`Slowest frames:`);
+			slowestFrames.forEach(({frame, time}) => {
+				Log.verbose(`Frame ${frame} (${time.toFixed(3)}ms)`);
+			});
+		},
+	});
+
 	Log.info();
-
+	Log.info();
 	const closeBrowserPromise = puppeteerInstance.close(false);
-
-	Log.info(chalk.green('\nYour still frame is ready!'));
 
 	const seconds = Math.round((Date.now() - startTime) / 1000);
 	Log.info(
@@ -261,6 +367,7 @@ const xstill = async (remotionRoot: string, args: string[]) => {
 	);
 	Log.info('-', 'Output can be found at:');
 	Log.info(chalk.cyan(`▶ ${absoluteOutputLocation}`));
+
 	try {
 		await closeBrowserPromise;
 		await RenderInternals.cleanDownloadMap(downloadMap);

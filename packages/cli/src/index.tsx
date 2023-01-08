@@ -92,6 +92,7 @@ export const cli = async () => {
 
 export {ConfigInternals, overrideRemotion} from './config/index';
 export * from './render';
+export {renderInner} from './render-inner';
 
 export const CliInternals = {
 	createOverwriteableCliOutput,

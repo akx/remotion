@@ -9,8 +9,6 @@ import {
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-// eslint-disable-next-line no-restricted-imports
-import {Internals} from 'remotion';
 import {chalk} from './chalk';
 import {ConfigInternals} from './config';
 import {findEntryPoint} from './entry-point';
@@ -33,9 +31,17 @@ import {
 } from './progress-bar';
 import {bundleOnCliOrTakeServeUrl} from './setup-cache';
 import type {RenderStep} from './step';
+import {truthy} from './truthy';
 import {getUserPassedOutputLocation} from './user-passed-output-location';
 
 export const render = async (remotionRoot: string, args: string[]) => {
+	if (parsedCli.frame) {
+		Log.error(
+			'--frame flag was passed to the `render` command. This flag only works with the `still` command. Did you mean `--frames`? See reference: https://www.remotion.dev/docs/cli/'
+		);
+		process.exit(1);
+	}
+
 	const startTime = Date.now();
 	const {
 		file,
@@ -56,36 +62,25 @@ export const render = async (remotionRoot: string, args: string[]) => {
 		? file
 		: path.join(process.cwd(), file);
 
-	const downloadMap = RenderInternals.makeDownloadMap();
-
-	if (parsedCli.frame) {
-		Log.error(
-			'--frame flag was passed to the `render` command. This flag only works with the `still` command. Did you mean `--frames`? See reference: https://www.remotion.dev/docs/cli/'
-		);
-		process.exit(1);
-	}
-
-	Log.verbose('Asset dirs', downloadMap.assetDir);
-
 	const {
-		concurrency,
-		frameRange,
-		shouldOutputImageSequence,
-		overwrite,
-		inputProps,
-		envVariables,
-		quality,
 		browser,
 		browserExecutable,
+		chromiumOptions,
+		concurrency,
+		envVariables,
+		everyNthFrame,
 		ffmpegExecutable,
 		ffprobeExecutable,
-		scale,
-		chromiumOptions,
-		port,
-		everyNthFrame,
-		puppeteerTimeout,
-		publicDir,
+		frameRange,
 		height,
+		inputProps,
+		overwrite,
+		port,
+		publicDir,
+		puppeteerTimeout,
+		quality,
+		scale,
+		shouldOutputImageSequence,
 		width,
 	} = await getCliOptions({
 		isLambda: false,
@@ -105,11 +100,11 @@ export const render = async (remotionRoot: string, args: string[]) => {
 
 	const browserInstance = openBrowser(browser, {
 		browserExecutable,
+		chromiumOptions,
 		shouldDumpIo: RenderInternals.isEqualOrBelowLogLevel(
 			ConfigInternals.Logging.getLogLevel(),
 			'verbose'
 		),
-		chromiumOptions,
 		forceDeviceScaleFactor: scale,
 	});
 
@@ -117,7 +112,7 @@ export const render = async (remotionRoot: string, args: string[]) => {
 		RenderInternals.isServeUrl(fullPath) ? null : ('bundling' as const),
 		'rendering' as const,
 		shouldOutputImageSequence ? null : ('stitching' as const),
-	].filter(Internals.truthy);
+	].filter(truthy);
 
 	const {urlOrBundle, cleanup: cleanupBundle} = await bundleOnCliOrTakeServeUrl(
 		{
@@ -138,26 +133,32 @@ export const render = async (remotionRoot: string, args: string[]) => {
 			totalBytes: null,
 		};
 		downloads.push(download);
-		updateRenderProgress();
+		updateProgress();
+
 		return ({percent, downloaded, totalSize}) => {
 			download.progress = percent;
 			download.totalBytes = totalSize;
 			download.downloaded = downloaded;
-			updateRenderProgress();
+			updateProgress();
 		};
 	};
 
 	const puppeteerInstance = await browserInstance;
 
+	const downloadMap = RenderInternals.makeDownloadMap();
+	Log.verbose('Asset dirs', downloadMap.assetDir);
+
 	const comps = await getCompositions(urlOrBundle, {
-		inputProps,
-		puppeteerInstance,
-		envVariables,
-		timeoutInMilliseconds: puppeteerTimeout,
-		chromiumOptions,
 		browserExecutable,
+		chromiumOptions,
 		downloadMap,
+		envVariables,
+		ffmpegExecutable,
+		ffprobeExecutable,
+		inputProps,
 		port,
+		puppeteerInstance,
+		timeoutInMilliseconds: puppeteerTimeout,
 	});
 
 	const {compositionId, config, reason, argsAfterComposition} =
@@ -189,19 +190,19 @@ export const render = async (remotionRoot: string, args: string[]) => {
 		args: argsAfterComposition,
 	});
 
+	const absoluteOutputLocation = getAndValidateAbsoluteOutputFile(
+		relativeOutputLocation,
+		overwrite
+	);
+
 	Log.info(
 		chalk.gray(
 			`Entry point = ${file} (${entryPointReason}), Composition = ${compositionId} (${reason}), Codec = ${codec} (${codecReason}), Output = ${relativeOutputLocation}`
 		)
 	);
 
-	const absoluteOutputFile = getAndValidateAbsoluteOutputFile(
-		relativeOutputLocation,
-		overwrite
-	);
-
 	const outputDir = shouldOutputImageSequence
-		? absoluteOutputFile
+		? absoluteOutputLocation
 		: await fs.promises.mkdtemp(path.join(os.tmpdir(), 'react-motion-render'));
 
 	Log.verbose('Output dir', outputDir);
@@ -222,7 +223,7 @@ export const render = async (remotionRoot: string, args: string[]) => {
 	let stitchStage: StitchingState = 'encoding';
 	const downloads: DownloadProgress[] = [];
 
-	const updateRenderProgress = () => {
+	const updateProgress = () => {
 		if (totalFrames.length === 0) {
 			throw new Error('totalFrames should not be 0');
 		}
@@ -256,7 +257,7 @@ export const render = async (remotionRoot: string, args: string[]) => {
 	);
 
 	if (shouldOutputImageSequence) {
-		fs.mkdirSync(absoluteOutputFile, {
+		fs.mkdirSync(absoluteOutputLocation, {
 			recursive: true,
 		});
 		if (imageFormat === 'none') {
@@ -273,7 +274,7 @@ export const render = async (remotionRoot: string, args: string[]) => {
 			inputProps,
 			onFrameUpdate: (rendered) => {
 				renderedFrames = rendered;
-				updateRenderProgress();
+				updateProgress();
 			},
 			onStart: () => undefined,
 			onDownload: (src: string) => {
@@ -309,18 +310,18 @@ export const render = async (remotionRoot: string, args: string[]) => {
 		});
 		renderedDoneIn = Date.now() - startTime;
 
-		updateRenderProgress();
+		updateProgress();
 		Log.info();
 		Log.info();
 		Log.info(chalk.green('\nYour image sequence is ready!'));
-		Log.info(chalk.cyan(`▶ ${absoluteOutputFile}`));
+		Log.info(chalk.cyan(`▶ ${absoluteOutputLocation}`));
 
 		return;
 	}
 
 	const options = await getRenderMediaOptions({
 		config,
-		outputLocation: absoluteOutputFile,
+		outputLocation: absoluteOutputLocation,
 		serveUrl: urlOrBundle,
 		codec,
 		remotionRoot,
@@ -334,7 +335,7 @@ export const render = async (remotionRoot: string, args: string[]) => {
 			renderedDoneIn = update.renderedDoneIn;
 			stitchStage = update.stitchStage;
 			renderedFrames = update.renderedFrames;
-			updateRenderProgress();
+			updateProgress();
 		},
 		puppeteerInstance,
 		onDownload,
@@ -350,6 +351,7 @@ export const render = async (remotionRoot: string, args: string[]) => {
 
 	Log.info();
 	Log.info();
+	const closeBrowserPromise = puppeteerInstance.close(false);
 
 	const seconds = Math.round((Date.now() - startTime) / 1000);
 	Log.info(
@@ -360,12 +362,12 @@ export const render = async (remotionRoot: string, args: string[]) => {
 		].join(' ')
 	);
 	Log.info('-', 'Output can be found at:');
-	Log.info(chalk.cyan(`▶ ${absoluteOutputFile}`));
+	Log.info(chalk.cyan(`▶ ${absoluteOutputLocation}`));
 
 	try {
-		await cleanupBundle();
+		await closeBrowserPromise;
 		await RenderInternals.cleanDownloadMap(downloadMap);
-
+		await cleanupBundle();
 		Log.verbose('Cleaned up', downloadMap.assetDir);
 	} catch (err) {
 		Log.warn('Could not clean up directory.');

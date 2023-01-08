@@ -32,6 +32,13 @@ import {
 } from './user-passed-output-location';
 
 export const still = async (remotionRoot: string, args: string[]) => {
+	if (parsedCli.frames) {
+		Log.error(
+			'--frames flag was passed to the `still` command. This flag only works with the `render` command. Did you mean `--frame`? See reference: https://www.remotion.dev/docs/cli/'
+		);
+		process.exit(1);
+	}
+
 	const startTime = Date.now();
 	const {
 		file,
@@ -52,29 +59,22 @@ export const still = async (remotionRoot: string, args: string[]) => {
 		? file
 		: path.join(process.cwd(), file);
 
-	if (parsedCli.frames) {
-		Log.error(
-			'--frames flag was passed to the `still` command. This flag only works with the `render` command. Did you mean `--frame`? See reference: https://www.remotion.dev/docs/cli/'
-		);
-		process.exit(1);
-	}
-
 	const {
-		inputProps,
-		envVariables,
-		quality,
 		browser,
-		stillFrame,
 		browserExecutable,
 		chromiumOptions,
-		scale,
+		envVariables,
 		ffmpegExecutable,
 		ffprobeExecutable,
+		height,
+		inputProps,
 		overwrite,
-		puppeteerTimeout,
 		port,
 		publicDir,
-		height,
+		puppeteerTimeout,
+		quality,
+		scale,
+		stillFrame,
 		width,
 	} = await getCliOptions({
 		isLambda: false,
@@ -82,6 +82,14 @@ export const still = async (remotionRoot: string, args: string[]) => {
 		remotionRoot,
 	});
 
+	const ffmpegVersion = await RenderInternals.getFfmpegVersion({
+		ffmpegExecutable,
+		remotionRoot,
+	});
+	Log.verbose(
+		'FFMPEG Version:',
+		ffmpegVersion ? ffmpegVersion.join('.') : 'Built from source'
+	);
 	Log.verbose('Browser executable: ', browserExecutable);
 
 	const browserInstance = openBrowser(browser, {
@@ -99,25 +107,51 @@ export const still = async (remotionRoot: string, args: string[]) => {
 		'rendering' as const,
 	].filter(truthy);
 
-	const {cleanup: cleanupBundle, urlOrBundle} = await bundleOnCliOrTakeServeUrl(
-		{fullPath, remotionRoot, steps, publicDir}
+	const {urlOrBundle, cleanup: cleanupBundle} = await bundleOnCliOrTakeServeUrl(
+		{
+			fullPath,
+			remotionRoot,
+			steps,
+			publicDir,
+		}
 	);
+
+	const onDownload: RenderMediaOnDownload = (src) => {
+		const id = Math.random();
+		const download: DownloadProgress = {
+			id,
+			name: src,
+			progress: 0,
+			downloaded: 0,
+			totalBytes: null,
+		};
+		downloads.push(download);
+		updateProgress();
+
+		return ({percent, downloaded, totalSize}) => {
+			download.progress = percent;
+			download.totalBytes = totalSize;
+			download.downloaded = downloaded;
+			updateProgress();
+		};
+	};
 
 	const puppeteerInstance = await browserInstance;
 
 	const downloadMap = RenderInternals.makeDownloadMap();
+	Log.verbose('Asset dirs', downloadMap.assetDir);
 
 	const comps = await getCompositions(urlOrBundle, {
-		inputProps,
-		puppeteerInstance,
-		envVariables,
-		timeoutInMilliseconds: puppeteerTimeout,
-		chromiumOptions,
-		port,
 		browserExecutable,
+		chromiumOptions,
+		downloadMap,
+		envVariables,
 		ffmpegExecutable,
 		ffprobeExecutable,
-		downloadMap,
+		inputProps,
+		port,
+		puppeteerInstance,
+		timeoutInMilliseconds: puppeteerTimeout,
 	});
 
 	const {compositionId, config, reason, argsAfterComposition} =
@@ -146,15 +180,14 @@ export const still = async (remotionRoot: string, args: string[]) => {
 		overwrite
 	);
 
-	mkdirSync(path.join(absoluteOutputLocation, '..'), {
-		recursive: true,
-	});
-
 	Log.info(
 		chalk.gray(
 			`Entry point = ${file} (${entryPointReason}), Output = ${relativeOutputLocation}, Format = ${imageFormat} (${source}), Composition = ${compositionId} (${reason})`
 		)
 	);
+	mkdirSync(path.join(absoluteOutputLocation, '..'), {
+		recursive: true,
+	});
 
 	const renderProgress = createOverwriteableCliOutput(quietFlagProvided());
 	const renderStart = Date.now();
@@ -180,24 +213,6 @@ export const still = async (remotionRoot: string, args: string[]) => {
 	};
 
 	updateProgress();
-
-	const onDownload: RenderMediaOnDownload = (src) => {
-		const id = Math.random();
-		const download: DownloadProgress = {
-			id,
-			name: src,
-			progress: 0,
-			downloaded: 0,
-			totalBytes: null,
-		};
-		downloads.push(download);
-		updateProgress();
-
-		return ({percent}) => {
-			download.progress = percent;
-			updateProgress();
-		};
-	};
 
 	await renderStill({
 		composition: config,
@@ -240,10 +255,28 @@ export const still = async (remotionRoot: string, args: string[]) => {
 		].join(' ')
 	);
 	Log.info('-', 'Output can be found at:');
-	Log.info(chalk.cyan(`▶️ ${absoluteOutputLocation}`));
-	await closeBrowserPromise;
-	await RenderInternals.cleanDownloadMap(downloadMap);
-	await cleanupBundle();
+	Log.info(chalk.cyan(`▶ ${absoluteOutputLocation}`));
+	try {
+		await closeBrowserPromise;
+		await RenderInternals.cleanDownloadMap(downloadMap);
+		await cleanupBundle();
+		Log.verbose('Cleaned up', downloadMap.assetDir);
+	} catch (err) {
+		Log.warn('Could not clean up directory.');
+		Log.warn(err);
+		Log.warn('Do you have minimum required Node.js version?');
+	}
 
-	Log.verbose('Cleaned up', downloadMap.assetDir);
+	Log.info(
+		chalk.green(`\nYour ${codec === 'gif' ? 'GIF' : 'video'} is ready!`)
+	);
+
+	if (
+		RenderInternals.isEqualOrBelowLogLevel(
+			ConfigInternals.Logging.getLogLevel(),
+			'verbose'
+		)
+	) {
+		RenderInternals.perf.logPerf();
+	}
 };
